@@ -11,7 +11,7 @@ from mmdet.core import DistEvalHook, EvalHook
 from mmdet.datasets import (build_dataloader, build_dataset,
                             replace_ImageToTensor)
 from mmdet.utils import get_root_logger
-
+from apex import amp
 
 def set_random_seed(seed, deterministic=False):
     """Set random seed.
@@ -68,19 +68,27 @@ def train_detector(model,
             seed=cfg.seed) for ds in dataset
     ]
 
+    # # build runner
+    # if cfg.opt_level is None:
+    #     cfg.opt_level='O0'
+    # optimizer = build_optimizer(model, cfg.optimizer)
+    # model, optimizer = amp.initialize(model.npu(), optimizer, 
+    #             opt_level=cfg.opt_level, loss_scale=64.0, combine_grad=True)
+
     # put model on gpus
     if distributed:
         find_unused_parameters = cfg.get('find_unused_parameters', False)
         # Sets the `find_unused_parameters` parameter in
         # torch.nn.parallel.DistributedDataParallel
         model = MMDistributedDataParallel(
-            model.cuda(),
-            device_ids=[torch.cuda.current_device()],
+            model.npu(),
+            device_ids=[torch.npu.current_device()],
             broadcast_buffers=False,
             find_unused_parameters=find_unused_parameters)
     else:
+        # torch.npu.set_device(cfg.gpu_ids[0])
         model = MMDataParallel(
-            model.cuda(cfg.gpu_ids[0]), device_ids=cfg.gpu_ids)
+            model.npu(), device_ids=cfg.gpu_ids)
 
     # build runner
     optimizer = build_optimizer(model, cfg.optimizer)

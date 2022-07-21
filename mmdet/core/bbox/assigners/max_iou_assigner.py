@@ -102,7 +102,8 @@ class MaxIoUAssigner(BaseAssigner):
             if gt_labels is not None:
                 gt_labels = gt_labels.cpu()
 
-        overlaps = self.iou_calculator(gt_bboxes, bboxes)
+        # overlaps = self.iou_calculator(gt_bboxes, bboxes)
+        overlaps = torch.npu_ptiou(bboxes, gt_bboxes)
 
         if (self.ignore_iof_thr > 0 and gt_bboxes_ignore is not None
                 and gt_bboxes_ignore.numel() > 0 and bboxes.numel() > 0):
@@ -140,7 +141,7 @@ class MaxIoUAssigner(BaseAssigner):
         # 1. assign -1 by default
         assigned_gt_inds = overlaps.new_full((num_bboxes, ),
                                              -1,
-                                             dtype=torch.long)
+                                             dtype=torch.int)
 
         if num_gts == 0 or num_bboxes == 0:
             # No ground truth or boxes, return empty assignment
@@ -170,8 +171,8 @@ class MaxIoUAssigner(BaseAssigner):
         # 2. assign negative: below
         # the negative inds are set to be 0
         if isinstance(self.neg_iou_thr, float):
-            assigned_gt_inds[(max_overlaps >= 0)
-                             & (max_overlaps < self.neg_iou_thr)] = 0
+            gt_inds_mask = (max_overlaps >= 0) & (max_overlaps < self.neg_iou_thr)
+            assigned_gt_inds = assigned_gt_inds * ~gt_inds_mask
         elif isinstance(self.neg_iou_thr, tuple):
             assert len(self.neg_iou_thr) == 2
             assigned_gt_inds[(max_overlaps >= self.neg_iou_thr[0])
@@ -179,7 +180,12 @@ class MaxIoUAssigner(BaseAssigner):
 
         # 3. assign positive: above positive IoU threshold
         pos_inds = max_overlaps >= self.pos_iou_thr
-        assigned_gt_inds[pos_inds] = argmax_overlaps[pos_inds] + 1
+        
+        if pos_inds.any():
+            temp = (argmax_overlaps.int() + 1) * pos_inds.int()
+            assigned_gt_inds = assigned_gt_inds * (~pos_inds).int() + temp
+
+        num_gts = num_gts - (gt_labels == 80).sum()
 
         if self.match_low_quality:
             # Low-quality matching will overwirte the assigned_gt_inds assigned
@@ -194,19 +200,23 @@ class MaxIoUAssigner(BaseAssigner):
                 if gt_max_overlaps[i] >= self.min_pos_iou:
                     if self.gt_max_assign_all:
                         max_iou_inds = overlaps[i, :] == gt_max_overlaps[i]
-                        assigned_gt_inds[max_iou_inds] = i + 1
+                        gt_inds_temp = assigned_gt_inds.new_full(assigned_gt_inds.size(), i + 1)
+                        assigned_gt_inds = torch.where(max_iou_inds, gt_inds_temp, assigned_gt_inds)
                     else:
                         assigned_gt_inds[gt_argmax_overlaps[i]] = i + 1
 
         if gt_labels is not None:
-            assigned_labels = assigned_gt_inds.new_full((num_bboxes, ), -1)
-            pos_inds = torch.nonzero(
-                assigned_gt_inds > 0, as_tuple=False).squeeze()
-            if pos_inds.numel() > 0:
-                assigned_labels[pos_inds] = gt_labels[
-                    assigned_gt_inds[pos_inds] - 1]
+            assigned_labels = assigned_gt_inds.new_full((num_bboxes, ), -1).long()
+            # pos_inds = torch.nonzero(
+            #     assigned_gt_inds > 0, as_tuple=False).squeeze()
+            # if pos_inds.numel() > 0:
+            pos_inds = assigned_gt_inds > 0
+            if pos_inds.sum() > 0:
+                assigned_labels_temp = torch.index_select(gt_labels.int(), 0, (assigned_gt_inds - 1) * pos_inds)
+                assigned_labels = torch.where(pos_inds, assigned_labels_temp, assigned_labels.int()).long()
         else:
             assigned_labels = None
-
+        
+        assigned_gt_inds = assigned_gt_inds.long()
         return AssignResult(
             num_gts, assigned_gt_inds, max_overlaps, labels=assigned_labels)

@@ -79,6 +79,10 @@ class AnchorHead(BaseDenseHead, BBoxTestMixin):
         self.loss_bbox = build_loss(loss_bbox)
         self.train_cfg = train_cfg
         self.test_cfg = test_cfg
+        self.anchor_list_v = None
+        self.anchor_list_h = None
+        self.valid_flag_list_v = None
+        self.valid_flag_list_h = None
         if self.train_cfg:
             self.assigner = build_assigner(self.train_cfg.assigner)
             # use PseudoSampler when sampling is False
@@ -141,6 +145,48 @@ class AnchorHead(BaseDenseHead, BBoxTestMixin):
                     is num_anchors * 4.
         """
         return multi_apply(self.forward_single, feats)
+
+    def get_anchors_ones(self, featmap_sizes, img_metas, device='cuda'):
+        """Get anchors according to feature map sizes.
+
+        Args:
+            featmap_sizes (list[tuple]): Multi-level feature map sizes.
+            img_metas (list[dict]): Image meta info.
+            device (torch.device | str): Device for returned tensors
+
+        Returns:
+            tuple:
+                anchor_list (list[Tensor]): Anchors of each image.
+                valid_flag_list (list[Tensor]): Valid flags of each image.
+        """
+        num_imgs = len(img_metas)
+        # v
+        if img_metas[0]['batch_input_shape'] == (800, 1344):
+            if self.anchor_list_v is None:
+                multi_level_anchors = self.anchor_generator.grid_anchors(featmap_sizes, device)
+                anchor_list = [multi_level_anchors for _ in range(num_imgs)]
+                self.anchor_list_v = anchor_list
+                multi_level_flags_v = self.anchor_generator.valid_flags(featmap_sizes, (800, 1344, 3), device)
+                valid_flag_list_v = [multi_level_flags_v for _ in range(num_imgs)]
+                self.valid_flag_list_v = valid_flag_list_v
+
+            anchor_list = self.anchor_list_v
+            valid_flag_list = self.valid_flag_list_v
+
+        # h
+        if img_metas[0]['batch_input_shape'] == (1344, 800):
+            if self.anchor_list_h is None:
+                multi_level_anchors = self.anchor_generator.grid_anchors(featmap_sizes, device)
+                anchor_list = [multi_level_anchors for _ in range(num_imgs)]
+                self.anchor_list_h = anchor_list
+                multi_level_flags_h = self.anchor_generator.valid_flags(featmap_sizes, (1344, 800, 3), device)
+                valid_flag_list_h = [multi_level_flags_h for _ in range(num_imgs)]
+                self.valid_flag_list_h = valid_flag_list_h
+
+            anchor_list = self.anchor_list_h
+            valid_flag_list = self.valid_flag_list_h
+
+        return anchor_list, valid_flag_list
 
     def get_anchors(self, featmap_sizes, img_metas, device='cuda'):
         """Get anchors according to feature map sizes.
@@ -217,11 +263,15 @@ class AnchorHead(BaseDenseHead, BBoxTestMixin):
         if not inside_flags.any():
             return (None, ) * 7
         # assign gt and sample anchors
-        anchors = flat_anchors[inside_flags, :]
+        anchors = flat_anchors * inside_flags.unsqueeze(1).float()
 
         assign_result = self.assigner.assign(
             anchors, gt_bboxes, gt_bboxes_ignore,
             None if self.sampling else gt_labels)
+
+        temp_bug = assign_result.gt_inds.int()
+        assign_result.gt_inds = (temp_bug + inside_flags.int() - 1).long()
+
         sampling_result = self.sampler.sample(assign_result, anchors,
                                               gt_bboxes)
 
@@ -230,43 +280,49 @@ class AnchorHead(BaseDenseHead, BBoxTestMixin):
         bbox_weights = torch.zeros_like(anchors)
         labels = anchors.new_full((num_valid_anchors, ),
                                   self.num_classes,
-                                  dtype=torch.long)
+                                  dtype=torch.int)
         label_weights = anchors.new_zeros(num_valid_anchors, dtype=torch.float)
 
         pos_inds = sampling_result.pos_inds
         neg_inds = sampling_result.neg_inds
-        if len(pos_inds) > 0:
+        pos_inds_unsqu = pos_inds.unsqueeze(1)
+        if pos_inds.sum() > 0:
             if not self.reg_decoded_bbox:
                 pos_bbox_targets = self.bbox_coder.encode(
-                    sampling_result.pos_bboxes, sampling_result.pos_gt_bboxes)
+                    sampling_result.pos_bboxes, sampling_result.pos_gt_bboxes * pos_inds_unsqu)
             else:
                 pos_bbox_targets = sampling_result.pos_gt_bboxes
-            bbox_targets[pos_inds, :] = pos_bbox_targets
-            bbox_weights[pos_inds, :] = 1.0
+
+            bbox_targets = pos_bbox_targets
+            bbox_weights = bbox_weights + pos_inds_unsqu.float()
             if gt_labels is None:
                 # Only rpn gives gt_labels as None
-                # Foreground is the first class since v2.5.0
-                labels[pos_inds] = 0
+                # Foreground is the first class since v2.5.0                
+                # labels[pos_inds] = 0
+                labels = labels * ~pos_inds
             else:
-                labels[pos_inds] = gt_labels[
-                    sampling_result.pos_assigned_gt_inds]
+                pos_gt_bboxes_temp = torch.index_select(gt_labels.int(), 0, sampling_result.pos_assigned_gt_inds.int())
+                labels = torch.where(pos_inds, pos_gt_bboxes_temp, labels)
             if self.train_cfg.pos_weight <= 0:
-                label_weights[pos_inds] = 1.0
+                # label_weights[pos_inds] = 1.0
+                label_weights = label_weights * (~pos_inds).float() + pos_inds.float()
             else:
-                label_weights[pos_inds] = self.train_cfg.pos_weight
+                # label_weights[pos_inds] = self.train_cfg.pos_weight
+                label_weights = label_weights * (~pos_inds).float() + pos_inds.float() * self.train_cfg.pos_weight
         if len(neg_inds) > 0:
-            label_weights[neg_inds] = 1.0
+            # label_weights[neg_inds] = 1.0
+            label_weights = label_weights * (~neg_inds).float() + neg_inds.float()
 
         # map up to original set of anchors
-        if unmap_outputs:
-            num_total_anchors = flat_anchors.size(0)
-            labels = unmap(
-                labels, num_total_anchors, inside_flags,
-                fill=self.num_classes)  # fill bg label
-            label_weights = unmap(label_weights, num_total_anchors,
-                                  inside_flags)
-            bbox_targets = unmap(bbox_targets, num_total_anchors, inside_flags)
-            bbox_weights = unmap(bbox_weights, num_total_anchors, inside_flags)
+        # if unmap_outputs:
+        #     num_total_anchors = flat_anchors.size(0)
+        #     labels = unmap(
+        #         labels, num_total_anchors, inside_flags,
+        #         fill=self.num_classes)  # fill bg label
+        #     label_weights = unmap(label_weights, num_total_anchors,
+        #                           inside_flags)
+        #     bbox_targets = unmap(bbox_targets, num_total_anchors, inside_flags)
+        #     bbox_weights = unmap(bbox_weights, num_total_anchors, inside_flags)
 
         return (labels, label_weights, bbox_targets, bbox_weights, pos_inds,
                 neg_inds, sampling_result)
@@ -354,8 +410,10 @@ class AnchorHead(BaseDenseHead, BBoxTestMixin):
         if any([labels is None for labels in all_labels]):
             return None
         # sampled anchors of all images
-        num_total_pos = sum([max(inds.numel(), 1) for inds in pos_inds_list])
-        num_total_neg = sum([max(inds.numel(), 1) for inds in neg_inds_list])
+        # num_total_pos = sum([max(inds.numel(), 1) for inds in pos_inds_list])
+        # num_total_neg = sum([max(inds.numel(), 1) for inds in neg_inds_list])
+        num_total_pos = sum([max(inds.sum(), 1) for inds in pos_inds_list])
+        num_total_neg = sum([max(inds.sum(), 1) for inds in neg_inds_list])
         # split targets to a list w.r.t. multiple levels
         labels_list = images_to_levels(all_labels, num_level_anchors)
         label_weights_list = images_to_levels(all_label_weights,
@@ -454,7 +512,7 @@ class AnchorHead(BaseDenseHead, BBoxTestMixin):
 
         device = cls_scores[0].device
 
-        anchor_list, valid_flag_list = self.get_anchors(
+        anchor_list, valid_flag_list = self.get_anchors_ones(
             featmap_sizes, img_metas, device=device)
         label_channels = self.cls_out_channels if self.use_sigmoid_cls else 1
         cls_reg_targets = self.get_targets(
@@ -662,7 +720,12 @@ class AnchorHead(BaseDenseHead, BBoxTestMixin):
             mlvl_scores = torch.cat([mlvl_scores, padding], dim=1)
 
         if with_nms:
-            det_bboxes, det_labels = multiclass_nms(mlvl_bboxes, mlvl_scores,
+            mlvl_bboxes_fix = torch.zeros(5000, 4).type_as(mlvl_bboxes)
+            mlvl_bboxes_fix[:mlvl_bboxes.size(0)] = mlvl_bboxes
+            classes_num = mlvl_scores.size(1)
+            mlvl_scores_fix = torch.zeros(5000, classes_num).type_as(mlvl_scores)
+            mlvl_scores_fix[:mlvl_scores.size(0)] = mlvl_scores
+            det_bboxes, det_labels = multiclass_nms(mlvl_bboxes_fix, mlvl_scores_fix,
                                                     cfg.score_thr, cfg.nms,
                                                     cfg.max_per_img)
             return det_bboxes, det_labels
